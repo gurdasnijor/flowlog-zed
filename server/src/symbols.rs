@@ -1,23 +1,28 @@
-//! Symbol index built from the tree-sitter-souffle grammar.
+//! Symbol index built from FlowLog's own (vendored) pest grammar.
 //!
-//! Indexes three kinds of named symbols and their occurrences, powering
-//! hover / go-to-definition / find-references / rename / document-symbols:
+//! Dialect-exact: understands `.decl` relations, `.extern fn` UDFs (declared
+//! with `.extern fn` and *called bare* as `name(args)`), `.type` aliases, and
+//! all extended constructs (`loop`/`fixpoint`) — none of which the
+//! tree-sitter-souffle grammar can parse. Powers hover / go-to-definition /
+//! find-references / rename / document-symbols.
 //!
-//! - **Relations** — declared by `.decl`, used in atoms and directives.
-//! - **Functors (UDFs)** — declared by `.functor`, used as `@name(...)`.
-//! - **Types** — declared by `.type`, used in attribute type positions.
+//! pest positions are 1-based (line, col); LSP positions are 0-based. Columns
+//! are code points, mapped 1:1 to UTF-16 — correct for ASCII (FlowLog
+//! identifiers are ASCII).
 //!
-//! Purely syntactic and independent of `flowlog-build` — the same grammar that
-//! drives highlighting.
-//!
-//! NOTE: tree-sitter columns are byte offsets; LSP columns are UTF-16. Mapped
-//! 1:1, correct for ASCII (all FlowLog identifiers/keywords are ASCII).
+//! Note: pest is all-or-nothing — on a syntax error the index is empty and
+//! navigation is unavailable until the buffer parses again (diagnostics, from
+//! flowlog-build, still report the error).
 
 use std::collections::HashMap;
 
 use lsp_types::{Position, Range};
-use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Parser, Query, QueryCursor};
+use pest::Parser;
+use pest_derive::Parser;
+
+#[derive(Parser)]
+#[grammar = "flowlog.pest"]
+struct FlowLogParser;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
@@ -25,24 +30,6 @@ pub enum Kind {
     Functor,
     Type,
 }
-
-const QUERY: &str = r#"
-(relation_decl head: (ident) @rel.def)
-(atom relation: (qualified_name (ident) @rel.use))
-(directive relation: (qualified_name (ident) @rel.use))
-
-(functor_decl name: (ident) @fn.def)
-(user_defined_functor name: (ident) @fn.use)
-
-(subtype left: (ident) @type.def)
-(type_synonym left: (ident) @type.def)
-(type_union left: (ident) @type.def)
-(type_record left: (ident) @type.def)
-(adt left: (ident) @type.def)
-(legacy_bare_type_decl (ident) @type.def)
-(attribute type: (qualified_name (ident) @type.use))
-(as type: (qualified_name (ident) @type.use))
-"#;
 
 pub struct Occurrence {
     pub kind: Kind,
@@ -63,14 +50,34 @@ pub struct Index {
 }
 
 impl Index {
-    /// The occurrence whose range covers `pos`, if any.
     pub fn occurrence_at(&self, pos: Position) -> Option<&Occurrence> {
         self.occurrences.iter().find(|o| covers(o.range, pos))
     }
 
-    /// Definitions for a resolved symbol.
     pub fn defs_of(&self, kind: Kind, name: &str) -> Option<&Vec<Definition>> {
         self.defs.get(&(kind, name.to_string()))
+    }
+
+    fn add_def(&mut self, kind: Kind, name: String, range: Range, signature: String) {
+        self.defs
+            .entry((kind, name.clone()))
+            .or_default()
+            .push(Definition { range, signature });
+        self.occurrences.push(Occurrence {
+            kind,
+            name,
+            range,
+            is_def: true,
+        });
+    }
+
+    fn add_use(&mut self, kind: Kind, name: String, range: Range) {
+        self.occurrences.push(Occurrence {
+            kind,
+            name,
+            range,
+            is_def: false,
+        });
     }
 }
 
@@ -81,91 +88,119 @@ fn covers(r: Range, p: Position) -> bool {
         && p.character <= r.end.character
 }
 
-fn node_range(n: Node) -> Range {
-    let s = n.start_position();
-    let e = n.end_position();
+type Pair<'a> = pest::iterators::Pair<'a, Rule>;
+
+fn span_range(span: pest::Span) -> Range {
+    let (sl, sc) = span.start_pos().line_col();
+    let (el, ec) = span.end_pos().line_col();
     Range {
-        start: Position::new(s.row as u32, s.column as u32),
-        end: Position::new(e.row as u32, e.column as u32),
+        start: Position::new(sl.saturating_sub(1) as u32, sc.saturating_sub(1) as u32),
+        end: Position::new(el.saturating_sub(1) as u32, ec.saturating_sub(1) as u32),
     }
 }
 
-/// First line of the enclosing declaration, for hover signatures.
-fn signature_of(mut node: Node, src: &str) -> String {
-    loop {
-        match node.kind() {
-            "relation_decl" | "functor_decl" | "type_decl" | "legacy_type_decl" => break,
-            _ => match node.parent() {
-                Some(p) => node = p,
-                None => break,
-            },
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// First direct child matching `target`.
+fn first_child<'a>(pair: &Pair<'a>, target: Rule) -> Option<Pair<'a>> {
+    pair.clone().into_inner().find(|p| p.as_rule() == target)
+}
+
+fn walk(pair: Pair, index: &mut Index) {
+    match pair.as_rule() {
+        Rule::declaration => {
+            let sig = first_line(pair.as_str());
+            if let Some(name) = first_child(&pair, Rule::relation_name) {
+                index.add_def(
+                    Kind::Relation,
+                    name.as_str().to_string(),
+                    span_range(name.as_span()),
+                    sig,
+                );
+            }
+            for child in pair.into_inner() {
+                if child.as_rule() != Rule::relation_name {
+                    walk(child, index);
+                }
+            }
+        }
+        Rule::extern_fn => {
+            let sig = first_line(pair.as_str());
+            if let Some(name) = first_child(&pair, Rule::identifier) {
+                index.add_def(
+                    Kind::Functor,
+                    name.as_str().to_string(),
+                    span_range(name.as_span()),
+                    sig,
+                );
+            }
+            for child in pair.into_inner() {
+                if child.as_rule() != Rule::identifier {
+                    walk(child, index);
+                }
+            }
+        }
+        Rule::type_alias_decl => {
+            let sig = first_line(pair.as_str());
+            if let Some(name) = first_child(&pair, Rule::identifier) {
+                index.add_def(
+                    Kind::Type,
+                    name.as_str().to_string(),
+                    span_range(name.as_span()),
+                    sig,
+                );
+            }
+            for child in pair.into_inner() {
+                if child.as_rule() != Rule::identifier {
+                    walk(child, index);
+                }
+            }
+        }
+        Rule::fn_call_expr => {
+            if let Some(name) = first_child(&pair, Rule::identifier) {
+                index.add_use(
+                    Kind::Functor,
+                    name.as_str().to_string(),
+                    span_range(name.as_span()),
+                );
+            }
+            for child in pair.into_inner() {
+                if child.as_rule() != Rule::identifier {
+                    walk(child, index);
+                }
+            }
+        }
+        Rule::relation_ref => {
+            index.add_use(
+                Kind::Relation,
+                pair.as_str().to_string(),
+                span_range(pair.as_span()),
+            );
+        }
+        Rule::alias_name => {
+            index.add_use(
+                Kind::Type,
+                pair.as_str().to_string(),
+                span_range(pair.as_span()),
+            );
+        }
+        _ => {
+            for child in pair.into_inner() {
+                walk(child, index);
+            }
         }
     }
-    node.utf8_text(src.as_bytes())
-        .unwrap_or("")
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
 }
 
-fn classify(capture_name: &str) -> Option<(Kind, bool)> {
-    let (prefix, role) = capture_name.split_once('.')?;
-    let kind = match prefix {
-        "rel" => Kind::Relation,
-        "fn" => Kind::Functor,
-        "type" => Kind::Type,
-        _ => return None,
-    };
-    Some((kind, role == "def"))
-}
-
-/// Build the symbol index for `src`. Empty index if parsing fails.
+/// Build the symbol index for `src`. Empty index if the buffer does not parse.
 pub fn build(src: &str) -> Index {
     let mut index = Index::default();
-    let language = tree_sitter_souffle::LANGUAGE.into();
-    let mut parser = Parser::new();
-    if parser.set_language(&language).is_err() {
-        return index;
-    }
-    let Some(tree) = parser.parse(src, None) else {
-        return index;
-    };
-    let Ok(query) = Query::new(&language, QUERY) else {
-        return index;
-    };
-    let names = query.capture_names();
-    let mut cursor = QueryCursor::new();
-    let mut caps = cursor.captures(&query, tree.root_node(), src.as_bytes());
-    while let Some(item) = caps.next() {
-        let mat = &item.0;
-        let cap = mat.captures[item.1];
-        let node = cap.node;
-        let Some((kind, is_def)) = classify(names[cap.index as usize]) else {
-            continue;
-        };
-        let text = node.utf8_text(src.as_bytes()).unwrap_or("").to_string();
-        if text.is_empty() {
-            continue;
+    if let Ok(mut pairs) = FlowLogParser::parse(Rule::main_grammar, src) {
+        if let Some(root) = pairs.next() {
+            walk(root, &mut index);
         }
-        let range = node_range(node);
-        if is_def {
-            index
-                .defs
-                .entry((kind, text.clone()))
-                .or_default()
-                .push(Definition {
-                    range,
-                    signature: signature_of(node, src),
-                });
-        }
-        index.occurrences.push(Occurrence {
-            kind,
-            name: text,
-            range,
-            is_def,
-        });
     }
     index
 }

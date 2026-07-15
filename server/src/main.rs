@@ -3,8 +3,8 @@
 //! - Diagnostics: `flowlog-build`'s real parser + typechecker (see `analyze`),
 //!   with automatic extended-mode retry for `loop`/`fixpoint` programs.
 //! - Hover / go-to-definition / find-references / rename / document-symbols /
-//!   completion for relations (and `.type` types): a tree-sitter symbol index
-//!   (see `symbols`).
+//!   completion for relations, `.extern fn` UDFs, and `.type` types: a symbol
+//!   index built from FlowLog's own pest grammar (see `symbols`).
 //!
 //! Speaks LSP over stdio; also supports `--check <file>` for a one-shot CLI
 //! diagnostic dump (used for smoke tests).

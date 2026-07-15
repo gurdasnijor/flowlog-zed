@@ -2,14 +2,16 @@
 
 Zed editor support for **FlowLog** / Soufflé-flavoured Datalog (`.dl`) files:
 
-- **Syntax highlighting** — via the [`tree-sitter-souffle`][tss] grammar.
-- **Outline** — relations and type declarations in the outline panel / symbol search.
+- **Syntax highlighting** — via the [`tree-sitter-souffle`][tss] grammar (basic
+  subset; see *Limitations*).
 - **Diagnostics** — real parse + type errors from FlowLog's own compiler front end
-  (`flowlog-build`), so the exact dialect is understood: `int32`, `IO="command"`,
-  extended syntax, etc.
-- **Hover, go-to-definition, find-references, rename** — for relations.
-- **Completion** — relations, directives, primitive types, keywords.
-- **Document symbols** — relations/types in outline + symbol search.
+  (`flowlog-build`), with automatic extended-mode retry for `loop`/`fixpoint`
+  programs. Exact dialect: `int32`/`uint*`/`f64`/`bool`, `.extern fn`, loop blocks.
+- **Hover, go-to-definition, find-references, rename** — for relations,
+  `.extern fn` UDFs (jump from a bare `f(x)` call to its `.extern fn`), and
+  `.type` aliases.
+- **Completion** — relations, UDFs, types, directives, primitive types, keywords.
+- **Document symbols** — relations / UDFs / types in outline + symbol search.
 
 ## Components
 
@@ -29,17 +31,25 @@ no runtime dependency beyond the (native) binary.
 
 Diagnostics use `flowlog-build` (with automatic extended-mode retry for
 `loop`/`fixpoint` programs). Hover / go-to-definition / find-references / rename /
-document-symbols / completion for relations use a tree-sitter symbol index.
-Highlighting and outline come from tree-sitter queries.
+document-symbols / completion are powered by a symbol index built from FlowLog's
+**own vendored pest grammar** (`server/src/flowlog.pest`) — dialect-exact, so
+`.extern fn` UDFs, bare UDF calls, `.type` aliases, and `loop`/`fixpoint` blocks
+all resolve correctly. (`flowlog-build`'s AST is sealed — `span()` is `pub(crate)` —
+so it can't drive editor positions; the pest grammar can.)
 
-**Not yet:** UDF (`.extern fn`) go-to-definition and highlighting of extended
-constructs (`loop`/`fixpoint`/`@it`) — the Souffle grammar can't parse them and
-`flowlog-build`'s AST is sealed (`pub(crate)`); this needs a FlowLog-specific
-tree-sitter grammar (planned).
+### Limitations
+
+- **Highlighting** uses the tree-sitter-souffle grammar, which parses the basic
+  Datalog subset but **not** FlowLog extensions (`.extern fn`, `loop`/`fixpoint`,
+  `@it`). Files using those get degraded highlighting on those lines. Full-dialect
+  highlighting needs a FlowLog-specific tree-sitter grammar (future work). All the
+  LSP features above are unaffected — they use the pest grammar, not tree-sitter.
+- Symbol navigation is single-file and requires the buffer to parse (pest is
+  all-or-nothing); diagnostics still report errors while the buffer is invalid.
 
 > Note: `flowlog-build`'s parser/typechecker modules are `pub` but `#[doc(hidden)]`
-> ("do not rely on these from external crates"), so this server may need updating when
-> `flowlog-build` changes its internals.
+> ("do not rely on these from external crates"), so the diagnostics path may need
+> updating when `flowlog-build` changes its internals.
 
 ## Install
 
