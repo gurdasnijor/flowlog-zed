@@ -7,6 +7,8 @@ Zed editor support for **FlowLog** / Soufflé-flavoured Datalog (`.dl`) files:
 - **Diagnostics** — real parse + type errors from FlowLog's own compiler front end
   (`flowlog-build`), so the exact dialect is understood: `int32`, `IO="command"`,
   extended syntax, etc.
+- **Hover, go-to-definition, find-references** — for relations, via a tree-sitter
+  symbol index.
 
 ## Components
 
@@ -24,9 +26,9 @@ links `flowlog-build` directly and calls its real `Program::parse` +
 `typechecker::check_program`, so diagnostics are exact for the FlowLog dialect with
 no runtime dependency beyond the (native) binary.
 
-It is diagnostics-focused. Hover / go-to-definition / rename / completion are **not**
-implemented (they would require a symbol index over the AST); highlighting and outline
-come from tree-sitter.
+Diagnostics use `flowlog-build`; hover / go-to-definition / find-references for
+relations use a tree-sitter symbol index. Rename and autocomplete are **not**
+implemented. Highlighting and outline come from tree-sitter queries.
 
 > Note: `flowlog-build`'s parser/typechecker modules are `pub` but `#[doc(hidden)]`
 > ("do not rely on these from external crates"), so this server may need updating when
