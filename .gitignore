@@ -1,0 +1,6 @@
+/target
+/server/target
+**/*.rs.bk
+.DS_Store
+# transient buffers written by the language server during analysis
+.*.flowloglsp.*.dl
