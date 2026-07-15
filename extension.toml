@@ -8,7 +8,7 @@ authors = ["Gurdas Nijor <nijor22@gmail.com>"]
 
 [grammars.flowlog]
 repository = "https://github.com/gurdasnijor/tree-sitter-flowlog"
-rev = "e876b8b1d341059df9295dda9372e78df60c41e9"
+rev = "f42a53ff317040c67d5b4057e0c77b98f8b3f2e3"
 
 [language_servers.flowlog-lsp]
 name = "FlowLog LSP"
