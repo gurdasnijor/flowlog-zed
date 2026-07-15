@@ -3,7 +3,7 @@
 //! Dialect-exact: understands `.decl` relations, `.extern fn` UDFs (declared
 //! with `.extern fn` and *called bare* as `name(args)`), `.type` aliases, and
 //! all extended constructs (`loop`/`fixpoint`) — none of which the
-//! tree-sitter-souffle grammar can parse. Powers hover / go-to-definition /
+//! tree-sitter-flowlog grammar can parse. Powers hover / go-to-definition /
 //! find-references / rename / document-symbols.
 //!
 //! pest positions are 1-based (line, col); LSP positions are 0-based. Columns
@@ -12,7 +12,7 @@
 //!
 //! Note: pest is all-or-nothing — on a syntax error the index is empty and
 //! navigation is unavailable until the buffer parses again (diagnostics, from
-//! flowlog-build, still report the error).
+//! flowlog-parser, still report the error).
 
 use std::collections::{HashMap, HashSet};
 
@@ -158,7 +158,7 @@ fn walk(pair: Pair, index: &mut Index) {
                 }
             }
         }
-        Rule::fn_call_expr => {
+        Rule::call_expr => {
             if let Some(name) = first_child(&pair, Rule::identifier) {
                 index.add_use(
                     Kind::Functor,
@@ -220,4 +220,59 @@ pub fn build(src: &str) -> Index {
         }
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexes_relation_defs_and_uses() {
+        let src = ".decl Edge(a: number, b: number)\n\
+                   .decl Path(a: number, b: number)\n\
+                   .output Path\n\
+                   Path(a, b) :- Edge(a, b).\n";
+        let idx = build(src);
+        assert!(idx.defs_of(Kind::Relation, "Edge").is_some(), "Edge def");
+        assert!(idx.defs_of(Kind::Relation, "Path").is_some(), "Path def");
+        assert!(
+            idx.occurrences
+                .iter()
+                .any(|o| o.kind == Kind::Relation && o.name == "Edge" && !o.is_def),
+            "Edge body use"
+        );
+    }
+
+    #[test]
+    fn indexes_extern_fn_def_and_call() {
+        // `ok(x) = 1` -> `ok` is a `call_expr` (the renamed `fn_call_expr`);
+        // its use must be classified as a Functor, resolving to the decl.
+        let src = ".decl A(x: number)\n\
+                   .decl B(x: number)\n\
+                   .extern fn ok(x: number) -> number\n\
+                   .output A\n\
+                   A(x) :- B(x), ok(x) = 1.\n";
+        let idx = build(src);
+        assert!(idx.defs_of(Kind::Functor, "ok").is_some(), "ok fn def");
+        assert!(
+            idx.occurrences
+                .iter()
+                .any(|o| o.kind == Kind::Functor && o.name == "ok" && !o.is_def),
+            "ok fn use"
+        );
+    }
+
+    #[test]
+    fn parses_main_next_constructs_for_indexing() {
+        // Raw strings are a main-next construct; pest is all-or-nothing, so a
+        // non-empty index proves the vendored grammar parses them.
+        let src = ".decl Msg(s: symbol)\n\
+                   .output Msg\n\
+                   Msg(r\"hi\").\n";
+        let idx = build(src);
+        assert!(
+            idx.defs_of(Kind::Relation, "Msg").is_some(),
+            "Msg def under raw-string program"
+        );
+    }
 }

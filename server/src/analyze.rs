@@ -1,7 +1,7 @@
 //! FlowLog source analysis: run FlowLog's real parser + typechecker over a
 //! buffer and lower the resulting diagnostics into LSP `Diagnostic`s.
 //!
-//! `flowlog_build`'s parser reads from disk (`SourceMap::load`), so an
+//! flowlog-parser's `parse` reads from disk (`SourceMap::load`), so an
 //! in-memory buffer is written to a temp sibling file first — keeping the
 //! document's directory context (and thus `.include` resolution) intact.
 //!
@@ -12,24 +12,15 @@
 use std::path::Path;
 
 use codespan_reporting::diagnostic::{Diagnostic as CsDiag, LabelStyle, Severity};
-use flowlog_build::common::{Config, Diagnostic as FlowDiag, ExecutionMode, FileId, SourceMap};
-use flowlog_build::parser::Program;
-use flowlog_build::typechecker::check_program;
+use flowlog_common::{Config, Diagnostic as FlowDiag, ExecutionMode, FileId, SourceMap};
+use flowlog_parser::parse;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 fn config_for(path: &str, mode: ExecutionMode) -> Config {
     Config {
         program: path.to_string(),
-        fact_dir: None,
-        executable_path: None,
-        output_dir: None,
         mode,
-        profile: false,
-        sip: false,
-        str_intern: false,
-        udf_file: None,
-        save_temps: false,
-        include_dirs: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -97,16 +88,13 @@ fn run(orig_path: &Path, text: &str, mode: ExecutionMode) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let tmp_str = tmp.to_string_lossy().to_string();
-    let cfg = config_for(&tmp_str, mode);
+    let mut cfg = config_for(&tmp_str, mode);
     let mut sm = SourceMap::new();
     let mut out = Vec::new();
-    match Program::parse(&tmp_str, cfg.is_extended(), &mut sm) {
-        Err(e) => out.push(cs_to_lsp(&e.to_diagnostic(), &sm)),
-        Ok(mut program) => {
-            if let Err(e) = check_program(&mut program, &cfg) {
-                out.push(cs_to_lsp(&e.to_diagnostic(), &sm));
-            }
-        }
+    // `parse` runs the full pipeline (parse + typecheck + fold + prune); any
+    // stage's failure — a type error included — surfaces as one `ParseError`.
+    if let Err(e) = parse(&tmp_str, &[], &mut sm, &mut cfg) {
+        out.push(cs_to_lsp(&e.to_diagnostic(), &sm));
     }
     let _ = std::fs::remove_file(&tmp);
     out
@@ -125,4 +113,48 @@ pub fn analyze(orig_path: &Path, text: &str) -> Vec<Diagnostic> {
         return run(orig_path, text, ExecutionMode::ExtendBatch);
     }
     diags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn doc(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn valid_program_is_clean() {
+        let src = ".decl Edge(a: number, b: number)\n\
+                   .decl Path(a: number, b: number)\n\
+                   .output Path\n\
+                   Path(a, b) :- Edge(a, b).\n";
+        let diags = analyze(&doc("flowlog_ok.dl"), src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn raw_string_fact_is_accepted() {
+        // Raw strings are a main-next grammar construct absent from published
+        // flowlog-build 0.3.4; the diagnostics path must accept them now.
+        let src = ".decl Msg(s: symbol)\n\
+                   .output Msg\n\
+                   Msg(r\"hi\").\n";
+        let diags = analyze(&doc("flowlog_raw.dl"), src);
+        assert!(
+            diags.is_empty(),
+            "raw string should parse+typecheck, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn undeclared_relation_is_reported() {
+        // A real error must still surface — proves the typechecker runs.
+        let src = ".decl A(x: number)\n\
+                   .output A\n\
+                   A(x) :- B(x).\n";
+        let diags = analyze(&doc("flowlog_err.dl"), src);
+        assert!(!diags.is_empty(), "undeclared relation B should error");
+    }
 }

@@ -7,7 +7,7 @@
 // Main grammar entry point
 main_grammar = {
     SOI ~
-    (declaration | type_alias_decl | extern_fn | include_directive | input_directive | output_directive | printsize_directive | comp_decl | init_decl | fixpoint_block | loop_block | fact | rule | plan_directive)* ~
+    (declaration | type_alias_decl | extern_fn | include_directive | input_directive | output_directive | printsize_directive | comp_decl | init_decl | fixpoint_block | loop_block | fact | rule)* ~
     EOI
 }
 
@@ -15,11 +15,16 @@ main_grammar = {
 // BASIC ELEMENTS (IDENTIFIERS, LITERALS, TYPES)
 // =============================================================================
 
-// Identifier pattern - must start with letter or underscore, 
+// Identifier pattern - must start with letter or underscore,
 // can contain letters, numbers, underscores
 // Valid examples: x, _temp, myVar123, _private_var
 // Invalid examples: 1x, x-yz (hyphen not allowed)
 identifier = @{ "_"? ~ ASCII_ALPHA+ ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// A keyword's trailing edge: the next char must NOT continue an identifier,
+// so a reserved word matches the whole token and not a prefix (`as` vs
+// `assert`, `match` vs `matches`). Silent: produces no node.
+word_boundary = _{ !(ASCII_ALPHANUMERIC | "_") }
 
 // Variable reference - variables used in rules and queries
 variable = { identifier }
@@ -36,9 +41,18 @@ relation_name = @{ identifier }
 // code can refer to inliner-produced relations like `c.Holds`.
 relation_ref = @{ identifier ~ ("." ~ identifier)* }
 
-// Type at a `.decl` attribute. `data_type` must come first so reserved
-// keywords (`number`, `symbol`, …) win over the catch-all identifier.
-type_ref = { data_type | alias_name }
+// An attribute's type, one of three forms (the `T` in `.decl R(x: T)`):
+//   tuple_type   `(a: symbol, b: number)`    a fixed tuple
+//   data_type    `symbol`                    a built-in primitive
+//   alias_name   `MyType`                    a user-defined `.type`
+// data_type before alias_name so primitives win over the catch-all identifier.
+// (`[ … ]` is reserved for a future array type.)
+type_ref = { tuple_type | data_type | alias_name }
+
+// A fixed tuple type, e.g. `(a: symbol, b: number)`: one or more fields, each a
+// `type_ref` (so tuples nest). Recursion is rejected by the type registry.
+tuple_type  = { "(" ~ tuple_field ~ ("," ~ tuple_field)* ~ ")" }
+tuple_field = { attribute_name ~ ":" ~ type_ref }
 
 // A user-declared type name at a *use* site. Resolved against the
 // [`TypeRegistry`] after parsing — includes top-level `.type` aliases
@@ -90,7 +104,7 @@ string_type = { "string" | "symbol" }
 bool_type = { "bool" }
 
 // Constant values
-constant = { boolean | float | integer | string } 
+constant = { boolean | float | integer | string }
 
 // Float with optional sign, must contain a decimal point
 // Examples: 1.5, -3.14, +0.0
@@ -100,16 +114,20 @@ float = @{ ("+" | "-")? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 // Examples: 42, -17, +100
 integer = @{ ("+" | "-")? ~ ASCII_DIGIT+ }
 
-// String enclosed in double quotes
-// Example: "hello world"
-string = { "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+// String literal in Rust syntax: quoted (Rust's escape alphabet) or raw
+// (r"..." / r#"..."#, no escapes). Decoded and validated by
+// `grammar::decode_string`; unknown escapes are an error, so regex
+// patterns belong in raw strings.
+string = @{ quoted_string | raw_string }
+quoted_string = @{ "\"" ~ ("\\" ~ ANY | !("\"" | "\\") ~ ANY)* ~ "\"" }
+raw_string = @{ "r" ~ PUSH("#"*) ~ "\"" ~ (!("\"" ~ PEEK) ~ ANY)* ~ "\"" ~ POP }
 
 // Placeholder for unused variables (underscore)
 // Used when you don't need to reference a variable
-placeholder = { "_" } 
+placeholder = { "_" }
 
 // Boolean literal values
-boolean = { ("True" | "False") ~ !(ASCII_ALPHANUMERIC | "_") } 
+boolean = { ("True" | "False") ~ word_boundary }
 
 // =============================================================================
 // RELATION DECLARATIONS
@@ -126,7 +144,7 @@ declaration = {
 }
 
 // Lets a subcomponent's `.override` replace this relation's rules.
-overridable_kw = @{ "overridable" ~ !(ASCII_ALPHANUMERIC | "_") }
+overridable_kw = @{ "overridable" ~ word_boundary }
 
 // Input directive for EDB relations - separate from declaration.
 // Parens are optional; an empty/missing param list means defaults
@@ -204,7 +222,21 @@ arithmetic_expr = { factor ~ (arithmetic_op ~ factor)* }
 // `paren_expr` gives explicit grouping: since arithmetic has no operator
 // precedence (it folds strictly left-to-right), parentheses are the only
 // way to override evaluation order, e.g. `x * (a + b)`.
-factor = { as_cast | builtin_fn_call | fn_call_expr | paren_expr | constant | variable }
+// One operand of an expression. Ordered choice: `tuple_lit` precedes
+// `paren_expr` because both open with `(`; the comma in a tuple literal is the
+// tiebreaker.
+factor = { as_cast | call_expr | tuple_lit | paren_expr | constant | variable }
+
+// A fixed-tuple literal. Constructs a tuple, or destructures one when matched
+// against a bound variable; a `_` element ignores that component on destructure:
+//   x = (a, b)     construct a 2-tuple
+//   (a, b) = x     destructure into `a` and `b`
+//   (a, _) = x     destructure, ignoring the second component
+//   (a,)           1-tuple — the trailing comma is required
+//   (a)            not a tuple: plain grouping, handled by `paren_expr`
+// The mandatory comma keeps `tuple_lit` distinct from `paren_expr`.
+tuple_lit  = { "(" ~ tuple_elem ~ (("," ~ tuple_elem)+ | ",") ~ ")" }
+tuple_elem = { arithmetic_expr | placeholder }
 
 // Parenthesised sub-expression. Both wrappers are silent (`_`): a
 // single-factor `(x)` surfaces as the bare inner factor, while a
@@ -219,7 +251,7 @@ group_expr  =  { factor ~ (arithmetic_op ~ factor)+ }
 // single `factor` (not `arithmetic_expr`) so the typechecker can lower
 // `as(...)` away after validation; for `as(x + 1, T)`, bind first.
 as_cast = { as_kw ~ "(" ~ factor ~ "," ~ type_ref ~ ")" }
-as_kw = _{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
+as_kw = _{ "as" ~ word_boundary }
 
 // Arithmetic operators. String concatenation lives in the `cat(a, b)`
 // built-in — there is no infix `cat` operator.
@@ -239,32 +271,7 @@ divide = { "/" }
 modulo = { "%" }
 
 // =============================================================================
-// BUILT-IN FUNCTIONS
-// =============================================================================
-// Reserved keyword call sites lowered inline by the codegen — they are
-// NOT user functions and share no infrastructure with `.extern fn`
-
-builtin_fn_call = {
-    builtin_op ~ "(" ~ (arithmetic_expr ~ ("," ~ arithmetic_expr)*)? ~ ")"
-}
-
-// `cat_op` is the Soufflé function form `cat(a, b)`. There is no
-// infix `cat`; chains nest as `cat(a, cat(b, c))`.
-builtin_op = {
-    strlen_op | substr_op | ord_op | contains_op | match_op | to_string_op | to_number_op | cat_op
-}
-
-strlen_op    = @{ "strlen"    ~ !(ASCII_ALPHANUMERIC | "_") }
-substr_op    = @{ "substr"    ~ !(ASCII_ALPHANUMERIC | "_") }
-ord_op       = @{ "ord"       ~ !(ASCII_ALPHANUMERIC | "_") }
-contains_op  = @{ "contains"  ~ !(ASCII_ALPHANUMERIC | "_") }
-match_op     = @{ "match"     ~ !(ASCII_ALPHANUMERIC | "_") }
-to_string_op = @{ "to_string" ~ !(ASCII_ALPHANUMERIC | "_") }
-to_number_op = @{ "to_number" ~ !(ASCII_ALPHANUMERIC | "_") }
-cat_op       = @{ "cat"       ~ !(ASCII_ALPHANUMERIC | "_") }
-
-// =============================================================================
-// COMPARISON EXPRESSIONS  
+// COMPARISON EXPRESSIONS
 // =============================================================================
 // Binary comparisons between arithmetic expressions
 
@@ -273,7 +280,7 @@ cat_op       = @{ "cat"       ~ !(ASCII_ALPHANUMERIC | "_") }
 compare_expr = { arithmetic_expr ~ compare_op ~ arithmetic_expr }
 
 // Comparison operators
-compare_op = { 
+compare_op = {
     equal |               // =
     not_equal |           // !=
     greater_equal_than |  // >=
@@ -283,12 +290,23 @@ compare_op = {
 }
 
 // Individual comparison operators
-equal = { "=" } 
+equal = { "=" }
 not_equal = { "!=" }
 greater_equal_than = { ">=" }
 greater_than = { ">" }
 less_equal_than = { "<=" }
 less_than = { "<" }
+
+// String constraints. They may only appear bare in a rule body,
+// never inside an arithmetic expression. Optional leading `!` negates.
+//   match("a.*", s)        s fully matches the regex
+//   contains(sub, s)       s contains the substring sub
+//   !match("a.*", s)       s does NOT match
+string_constraint = { not_op? ~ string_constraint_op ~ "(" ~ arithmetic_expr ~ "," ~ arithmetic_expr ~ ")" }
+string_constraint_op = { match_op | contains_op }
+not_op       = { "!" }
+match_op     = @{ "match"    ~ word_boundary }
+contains_op  = @{ "contains" ~ word_boundary }
 
 // =============================================================================
 // AGGREGATE EXPRESSIONS
@@ -297,12 +315,12 @@ less_than = { "<" }
 
 // Aggregation operation on a value
 // Examples: count(x), avg(x + y), sum(weight)
-aggregate_expr = { 
-    aggregate_op ~ 
-    "(" ~ 
+aggregate_expr = {
+    aggregate_op ~
+    "(" ~
     arithmetic_expr ~
-    ")" 
-} 
+    ")"
+}
 
 // Supported aggregate operators
 aggregate_op = { count | average | sum | min | max }
@@ -334,7 +352,7 @@ atom = {
 negative_atom = { "!" ~ ("(" ~ atom ~ ")" | atom) }
 
 // Arguments in atoms can be constants, variables, or placeholders
-atom_arg = { constant | variable | placeholder } 
+atom_arg = { constant | variable | placeholder }
 
 // =============================================================================
 // RULES SECTION
@@ -347,10 +365,15 @@ atom_arg = { constant | variable | placeholder }
 // Example: edge(1, 2).
 fact = { head ~ "." }
 
-// Rule with optional multi-head and multi-body (Souffle-style).
-// Commas separate alternative heads, semicolons separate alternative bodies:
-//   h1, h2 :- b1; b2.  →  h1:-b1. h1:-b2. h2:-b1. h2:-b2.
-rule = { rule_heads ~ ":-" ~ rule_bodies ~ "." }
+// Rule with optional multi-head and multi-body. Commas separate
+// alternative heads, semicolons separate alternative bodies:
+//   h1, h2 :- b1; b2.  ->  h1:-b1. h1:-b2. h2:-b1. h2:-b2.
+//
+// A trailing `.plan` hint binds to the rule it immediately follows.
+// Parsed as a child here so adjacency is a grammar guarantee, not a
+// post-parse check; a `.plan` that follows no rule has no production and
+// is a syntax error.
+rule = { rule_heads ~ ":-" ~ rule_bodies ~ "." ~ plan_directive? }
 
 // Plan hint pinning the join order of the immediately preceding rule's
 // positive body atoms. Indices are 1-based positions of positive atoms in
@@ -393,9 +416,12 @@ head = {
 // Can be aggregate functions or arithmetic expressions (UDF calls are parsed as factors within arithmetic)
 head_arg = { aggregate_expr | arithmetic_expr }
 
-// User-defined function call in rule head
-// Example: my_udf(x, y + 1)
-fn_call_expr = {
+// A value function call: `name(args...)`. The parser resolves the name
+// against the reserved built-in set ([`BuiltinOperator::from_keyword`]):
+// a hit becomes a built-in call, otherwise a UDF (`.extern fn`) call.
+// Appears inside expressions, never bare in a body.
+// Example: cat(a, b), strlen(x), my_udf(x, y + 1)
+call_expr = {
     identifier ~
     "(" ~
     (arithmetic_expr ~ ("," ~ arithmetic_expr)*)? ~
@@ -405,15 +431,17 @@ fn_call_expr = {
 // Comma-separated list of predicates in the rule body
 predicates = { predicate ~ ("," ~ predicate)* }
 
-// Types of predicates allowed in rule bodies
-// Note: compare_expr must come before atom because compare_expr can start with
-// fn_call_expr (e.g., "cost(x) > 5") which atom would greedily consume.
+// Types of predicates allowed in a rule body. Order matters (ordered choice):
+//   - compare_expr before atom: `cost(x) > 5` starts with a call that atom
+//     would otherwise consume as a relation.
+//   - string_constraint before atom/negative_atom: `match(...)` would parse
+//     as an atom named `match`, and `!match(...)` as a negative atom.
 predicate = {
-    compare_expr |  // Comparison: x > y, cost(x) > 5
-    atom |          // Positive atom: edge(x, y)
-    negative_atom | // Negative atom: !edge(x, y)
-    disjunction_group | // Nested disjunction: (A ; B)
-    fn_call_expr    // UDF predicate: is_valid(x + 1, y)
+    compare_expr |       // Comparison: x > y, cost(x) > 5, f(x) = True
+    string_constraint |  // match("a.*", x), !contains(x, y)
+    atom |               // Positive atom: edge(x, y)
+    negative_atom |      // Negative atom: !edge(x, y)
+    disjunction_group    // Nested disjunction: (A ; B)
 }
 
 // Parenthesised disjunction inside a body: `(A ; B)`.
@@ -465,11 +493,11 @@ disjunction_group = { "(" ~ rule_bodies ~ ")" }
 //   loop until { Done } while { @it >= 5 and @it <= 10 } { ... }
 
 fixpoint_block = {
-    "fixpoint" ~ "{" ~ iterative_directive* ~ (rule | plan_directive)* ~ "}"
+    "fixpoint" ~ "{" ~ iterative_directive* ~ rule* ~ "}"
 }
 
 loop_block = {
-    "loop" ~ loop_condition ~ "{" ~ iterative_directive* ~ (rule | plan_directive)* ~ "}"
+    "loop" ~ loop_condition ~ "{" ~ iterative_directive* ~ rule* ~ "}"
 }
 
 // .iterative <relation_name> — marks a relation as using replacement (new_from)
@@ -511,8 +539,8 @@ loop_bool_relation = { relation_ref }
 
 // Boolean connective joining clauses or sub-conditions.
 loop_connective = { loop_and | loop_or }
-loop_and        = @{ "and" ~ !(ASCII_ALPHANUMERIC | "_") }
-loop_or         = @{ "or"  ~ !(ASCII_ALPHANUMERIC | "_") }
+loop_and        = @{ "and" ~ word_boundary }
+loop_or         = @{ "or"  ~ word_boundary }
 
 // =============================================================================
 // TYPE DECLARATIONS (.type)
@@ -572,7 +600,7 @@ init_decl = { ".init" ~ identifier ~ "=" ~ identifier ~ comp_type_args? }
 comp_body_item = {
     declaration | type_alias_decl | input_directive | output_directive
     | printsize_directive | rule | fact | comp_decl | init_decl
-    | override_directive | plan_directive
+    | override_directive
 }
 
 // Drop inherited rules and facts for `Name`; the parent's `.decl Name`

@@ -2,7 +2,7 @@
 name = "flowlog-lsp"
 version = "0.1.0"
 edition = "2021"
-description = "Language server for FlowLog / Datalog (.dl): diagnostics via flowlog-build, symbols via FlowLog's own pest grammar"
+description = "Language server for FlowLog / Datalog (.dl): diagnostics via flowlog-parser, symbols via FlowLog's own pest grammar"
 license = "Apache-2.0"
 repository = "https://github.com/gurdasnijor/flowlog-zed"
 
@@ -11,7 +11,12 @@ name = "flowlog-lsp"
 path = "src/main.rs"
 
 [dependencies]
-flowlog-build = "0.3"
+# TEMP: local path deps on the unpublished flowlog-rs/flowlog `main-next` branch,
+# so diagnostics track the same grammar generation as the vendored `flowlog.pest`.
+# Local-only — breaks CI / other machines. Revert to a crates.io `flowlog-parser`
+# release once main-next is published.
+flowlog-parser = { path = "../../../flowlog-rs/flowlog/flowlog-parser" }
+flowlog-common = { path = "../../../flowlog-rs/flowlog/flowlog-common" }
 codespan-reporting = "0.13"
 lsp-server = "0.7"
 lsp-types = "0.95"

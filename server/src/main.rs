@@ -1,6 +1,6 @@
 //! FlowLog Datalog language server.
 //!
-//! - Diagnostics: `flowlog-build`'s real parser + typechecker (see `analyze`),
+//! - Diagnostics: `flowlog-parser`'s real parser + typechecker (see `analyze`),
 //!   with automatic extended-mode retry for `loop`/`fixpoint` programs.
 //! - Hover / go-to-definition / find-references / rename / document-symbols /
 //!   completion for relations, `.extern fn` UDFs, and `.type` types: a symbol
