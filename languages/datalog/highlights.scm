@@ -20,6 +20,10 @@
   ".init"
   ".plan"
   ".override"
+  ".extern"
+  "fn"
+  ".include"
+  ".iterative"
 ] @keyword
 
 ; Relation qualifiers / storage & aggregator keywords
@@ -45,6 +49,10 @@
   "range"
   "match"
   "contains"
+  "fixpoint"
+  "loop"
+  "while"
+  "until"
 ] @keyword
 
 ; Types
@@ -66,6 +74,8 @@
 ; Intrinsic functors
 (intrinsic_functor) @function
 (user_defined_functor (ident) @function)
+(extern_fn name: (ident) @function)
+(call_expr name: (ident) @function)
 
 ; Constants
 (string) @string
@@ -77,6 +87,7 @@
 ; Variables & wildcard
 (variable (ident) @variable)
 (anonymous) @variable.special
+(iteration_var) @variable.special
 
 ; Operators
 ":-" @operator
@@ -88,6 +99,9 @@
 (comparison operator: _ @operator)
 (binary_op operator: _ @operator)
 (unary_op operator: _ @operator)
+"->" @operator
+(loop_connective) @keyword
+(loop_iter_op) @operator
 
 ; Punctuation
 [

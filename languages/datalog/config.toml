@@ -1,5 +1,5 @@
 name = "Datalog"
-grammar = "souffle"
+grammar = "flowlog"
 path_suffixes = ["dl"]
 line_comments = ["// "]
 autoclose_before = ",);]}"

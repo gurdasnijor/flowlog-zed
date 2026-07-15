@@ -14,7 +14,7 @@
 //! navigation is unavailable until the buffer parses again (diagnostics, from
 //! flowlog-build, still report the error).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lsp_types::{Position, Range};
 use pest::Parser;
@@ -200,6 +200,23 @@ pub fn build(src: &str) -> Index {
     if let Ok(mut pairs) = FlowLogParser::parse(Rule::main_grammar, src) {
         if let Some(root) = pairs.next() {
             walk(root, &mut index);
+        }
+    }
+    // Bare body UDF calls (`is_ok(x, y)` as a filter) parse as relation refs;
+    // FlowLog resolves calls by name, so reclassify any relation-use whose name
+    // has an `.extern fn` declaration to a Functor use — enabling UDF
+    // go-to-definition / hover / references on bare body calls.
+    let functor_names: HashSet<String> = index
+        .defs
+        .keys()
+        .filter(|(k, _)| *k == Kind::Functor)
+        .map(|(_, n)| n.clone())
+        .collect();
+    if !functor_names.is_empty() {
+        for occ in &mut index.occurrences {
+            if occ.kind == Kind::Relation && functor_names.contains(&occ.name) {
+                occ.kind = Kind::Functor;
+            }
         }
     }
     index

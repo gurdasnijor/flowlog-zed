@@ -6,9 +6,9 @@ description = "Syntax highlighting, outline, and diagnostics for FlowLog / Souff
 repository = "https://github.com/gurdasnijor/flowlog-zed"
 authors = ["Gurdas Nijor <nijor22@gmail.com>"]
 
-[grammars.souffle]
-repository = "https://github.com/langston-barrett/tree-sitter-souffle"
-rev = "0ca94fad4422bc9a391f81418b5716e3af00ed2f"
+[grammars.flowlog]
+repository = "https://github.com/gurdasnijor/tree-sitter-flowlog"
+rev = "e876b8b1d341059df9295dda9372e78df60c41e9"
 
 [language_servers.flowlog-lsp]
 name = "FlowLog LSP"
