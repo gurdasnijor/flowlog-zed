@@ -4,6 +4,10 @@
 //! `flowlog_build`'s parser reads from disk (`SourceMap::load`), so an
 //! in-memory buffer is written to a temp sibling file first — keeping the
 //! document's directory context (and thus `.include` resolution) intact.
+//!
+//! Mode: we analyze in `DatalogBatch` first; if that reports the program needs
+//! extended mode (explicit `loop`/`fixpoint` blocks), we re-analyze in
+//! `ExtendBatch`.
 
 use std::path::Path;
 
@@ -13,13 +17,13 @@ use flowlog_build::parser::Program;
 use flowlog_build::typechecker::check_program;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-fn config_for(path: &str) -> Config {
+fn config_for(path: &str, mode: ExecutionMode) -> Config {
     Config {
         program: path.to_string(),
         fact_dir: None,
         executable_path: None,
         output_dir: None,
-        mode: ExecutionMode::default(),
+        mode,
         profile: false,
         sip: false,
         str_intern: false,
@@ -30,9 +34,7 @@ fn config_for(path: &str) -> Config {
 }
 
 /// `SourceMap::line_col` is 1-based; LSP positions are 0-based.
-/// NOTE: `character` is a byte offset within the line — correct for ASCII
-/// (all FlowLog keywords/identifiers are ASCII); non-ASCII columns would need
-/// UTF-16 remapping.
+/// NOTE: `character` is a byte offset within the line — correct for ASCII.
 fn pos(sm: &SourceMap, file: FileId, byte: usize) -> Position {
     let (line, col) = sm.line_col(file, byte as u32);
     Position {
@@ -84,10 +86,7 @@ fn cs_to_lsp(cs: &CsDiag<FileId>, sm: &SourceMap) -> Diagnostic {
     }
 }
 
-/// Parse + typecheck `text` as the document at `orig_path`; return LSP
-/// diagnostics. FlowLog's pipeline is fail-fast, so at most one error is
-/// reported per pass (the next surfaces once the current is fixed).
-pub fn analyze(orig_path: &Path, text: &str) -> Vec<Diagnostic> {
+fn run(orig_path: &Path, text: &str, mode: ExecutionMode) -> Vec<Diagnostic> {
     let dir = orig_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = orig_path
         .file_stem()
@@ -98,7 +97,7 @@ pub fn analyze(orig_path: &Path, text: &str) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let tmp_str = tmp.to_string_lossy().to_string();
-    let cfg = config_for(&tmp_str);
+    let cfg = config_for(&tmp_str, mode);
     let mut sm = SourceMap::new();
     let mut out = Vec::new();
     match Program::parse(&tmp_str, cfg.is_extended(), &mut sm) {
@@ -111,4 +110,19 @@ pub fn analyze(orig_path: &Path, text: &str) -> Vec<Diagnostic> {
     }
     let _ = std::fs::remove_file(&tmp);
     out
+}
+
+/// Parse + typecheck `text` as the document at `orig_path`; return LSP
+/// diagnostics. FlowLog's pipeline is fail-fast, so at most one error is
+/// reported per pass. Retries in extended mode if the program needs `loop`
+/// blocks.
+pub fn analyze(orig_path: &Path, text: &str) -> Vec<Diagnostic> {
+    let diags = run(orig_path, text, ExecutionMode::DatalogBatch);
+    if diags
+        .iter()
+        .any(|d| d.message.contains("extend-batch") || d.message.contains("extend-inc"))
+    {
+        return run(orig_path, text, ExecutionMode::ExtendBatch);
+    }
+    diags
 }

@@ -1,8 +1,10 @@
 //! FlowLog Datalog language server.
 //!
-//! - Diagnostics: `flowlog-build`'s real parser + typechecker (see `analyze`).
-//! - Hover / go-to-definition / find-references for relations: a tree-sitter
-//!   symbol index (see `symbols`).
+//! - Diagnostics: `flowlog-build`'s real parser + typechecker (see `analyze`),
+//!   with automatic extended-mode retry for `loop`/`fixpoint` programs.
+//! - Hover / go-to-definition / find-references / rename / document-symbols /
+//!   completion for relations (and `.type` types): a tree-sitter symbol index
+//!   (see `symbols`).
 //!
 //! Speaks LSP over stdio; also supports `--check <file>` for a one-shot CLI
 //! diagnostic dump (used for smoke tests).
@@ -17,14 +19,34 @@ use std::path::Path;
 use analyze::analyze;
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, Location, MarkupContent, MarkupKind, OneOf, Position,
-    PublishDiagnosticsParams, ReferenceParams, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url,
+    PublishDiagnosticsParams, RenameParams, ServerCapabilities, SymbolKind,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit,
 };
 
+use symbols::Kind;
+
 type Res = Result<(), Box<dyn Error + Sync + Send>>;
+
+const DIRECTIVES: &[&str] = &[
+    ".decl",
+    ".input",
+    ".output",
+    ".printsize",
+    ".include",
+    ".extern",
+    ".type",
+    ".pragma",
+];
+const TYPES: &[&str] = &[
+    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "f32", "f64",
+    "string", "bool",
+];
+const KEYWORDS: &[&str] = &["fixpoint", "loop", "while", "until", "True", "False"];
 
 fn main() -> Res {
     let args: Vec<String> = std::env::args().collect();
@@ -60,6 +82,12 @@ fn run_lsp() -> Res {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+            ..Default::default()
+        }),
         ..Default::default()
     })?;
     let _init_params = connection.initialize(capabilities)?;
@@ -87,7 +115,6 @@ fn main_loop(conn: &Connection) -> Res {
                 }
                 "textDocument/didChange" => {
                     let p: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
-                    // FULL sync: the last change carries the whole document.
                     if let Some(change) = p.content_changes.into_iter().last() {
                         docs.insert(p.text_document.uri.clone(), change.text.clone());
                         publish(conn, p.text_document.uri, &change.text)?;
@@ -101,11 +128,8 @@ fn main_loop(conn: &Connection) -> Res {
                     }
                 }
                 "textDocument/didClose" => {
-                    if let Ok(p) =
-                        serde_json::from_value::<lsp_types::DidCloseTextDocumentParams>(not.params)
-                    {
-                        docs.remove(&p.text_document.uri);
-                    }
+                    let p: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
+                    docs.remove(&p.text_document.uri);
                 }
                 _ => {}
             },
@@ -134,33 +158,61 @@ fn null_response(id: lsp_server::RequestId) -> Response {
 fn handle_request(req: Request, docs: &HashMap<Url, String>) -> Response {
     let id = req.id.clone();
     match req.method.as_str() {
-        "textDocument/hover" => {
-            let Ok(p) = serde_json::from_value::<HoverParams>(req.params) else {
-                return null_response(id);
-            };
-            let loc = p.text_document_position_params;
-            hover(docs, &loc.text_document.uri, loc.position)
-                .map(|h| ok_response(id.clone(), h))
-                .unwrap_or_else(|| null_response(id))
-        }
+        "textDocument/hover" => match serde_json::from_value::<HoverParams>(req.params) {
+            Ok(p) => {
+                let loc = p.text_document_position_params;
+                hover(docs, &loc.text_document.uri, loc.position)
+                    .map(|h| ok_response(id.clone(), h))
+                    .unwrap_or_else(|| null_response(id))
+            }
+            Err(_) => null_response(id),
+        },
         "textDocument/definition" => {
-            let Ok(p) = serde_json::from_value::<GotoDefinitionParams>(req.params) else {
-                return null_response(id);
-            };
-            let loc = p.text_document_position_params;
-            definition(docs, &loc.text_document.uri, loc.position)
-                .map(|d| ok_response(id.clone(), d))
-                .unwrap_or_else(|| null_response(id))
+            match serde_json::from_value::<GotoDefinitionParams>(req.params) {
+                Ok(p) => {
+                    let loc = p.text_document_position_params;
+                    definition(docs, &loc.text_document.uri, loc.position)
+                        .map(|d| ok_response(id.clone(), d))
+                        .unwrap_or_else(|| null_response(id))
+                }
+                Err(_) => null_response(id),
+            }
         }
         "textDocument/references" => {
-            let Ok(p) = serde_json::from_value::<ReferenceParams>(req.params) else {
-                return null_response(id);
-            };
-            let include_decl = p.context.include_declaration;
-            let loc = p.text_document_position;
-            let refs = references(docs, &loc.text_document.uri, loc.position, include_decl);
-            ok_response(id, refs)
+            match serde_json::from_value::<lsp_types::ReferenceParams>(req.params) {
+                Ok(p) => {
+                    let include_decl = p.context.include_declaration;
+                    let loc = p.text_document_position;
+                    ok_response(
+                        id,
+                        references(docs, &loc.text_document.uri, loc.position, include_decl),
+                    )
+                }
+                Err(_) => null_response(id),
+            }
         }
+        "textDocument/rename" => match serde_json::from_value::<RenameParams>(req.params) {
+            Ok(p) => {
+                let loc = p.text_document_position;
+                rename(docs, &loc.text_document.uri, loc.position, &p.new_name)
+                    .map(|w| ok_response(id.clone(), w))
+                    .unwrap_or_else(|| null_response(id))
+            }
+            Err(_) => null_response(id),
+        },
+        "textDocument/documentSymbol" => {
+            match serde_json::from_value::<DocumentSymbolParams>(req.params) {
+                Ok(p) => ok_response(id, document_symbols(docs, &p.text_document.uri)),
+                Err(_) => null_response(id),
+            }
+        }
+        "textDocument/completion" => match serde_json::from_value::<CompletionParams>(req.params) {
+            Ok(p) => {
+                let uri = p.text_document_position.text_document.uri;
+                ok_response(id, completion(docs, &uri))
+            }
+            Err(_) => null_response(id),
+        },
         _ => null_response(id),
     }
 }
@@ -169,7 +221,7 @@ fn hover(docs: &HashMap<Url, String>, uri: &Url, pos: Position) -> Option<Hover>
     let text = docs.get(uri)?;
     let index = symbols::build(text);
     let occ = index.occurrence_at(pos)?;
-    let defs = index.defs.get(&occ.name)?;
+    let defs = index.defs_of(occ.kind, &occ.name)?;
     let sigs: Vec<String> = defs.iter().map(|d| d.signature.clone()).collect();
     if sigs.is_empty() {
         return None;
@@ -191,7 +243,7 @@ fn definition(
     let text = docs.get(uri)?;
     let index = symbols::build(text);
     let occ = index.occurrence_at(pos)?;
-    let defs = index.defs.get(&occ.name)?;
+    let defs = index.defs_of(occ.kind, &occ.name)?;
     let locations: Vec<Location> = defs
         .iter()
         .map(|d| Location {
@@ -218,16 +270,108 @@ fn references(
     let Some(occ) = index.occurrence_at(pos) else {
         return Vec::new();
     };
-    let name = occ.name.clone();
+    let (kind, name) = (occ.kind, occ.name.clone());
     index
         .occurrences
         .iter()
-        .filter(|o| o.name == name && (include_decl || !o.is_def))
+        .filter(|o| o.kind == kind && o.name == name && (include_decl || !o.is_def))
         .map(|o| Location {
             uri: uri.clone(),
             range: o.range,
         })
         .collect()
+}
+
+fn rename(
+    docs: &HashMap<Url, String>,
+    uri: &Url,
+    pos: Position,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
+    let text = docs.get(uri)?;
+    let index = symbols::build(text);
+    let occ = index.occurrence_at(pos)?;
+    let (kind, name) = (occ.kind, occ.name.clone());
+    let edits: Vec<TextEdit> = index
+        .occurrences
+        .iter()
+        .filter(|o| o.kind == kind && o.name == name)
+        .map(|o| TextEdit {
+            range: o.range,
+            new_text: new_name.to_string(),
+        })
+        .collect();
+    if edits.is_empty() {
+        return None;
+    }
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), edits);
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
+}
+
+fn document_symbols(docs: &HashMap<Url, String>, uri: &Url) -> DocumentSymbolResponse {
+    let Some(text) = docs.get(uri) else {
+        return DocumentSymbolResponse::Nested(Vec::new());
+    };
+    let index = symbols::build(text);
+    let mut syms: Vec<DocumentSymbol> = Vec::new();
+    for ((kind, name), defs) in &index.defs {
+        for d in defs {
+            #[allow(deprecated)]
+            syms.push(DocumentSymbol {
+                name: name.clone(),
+                detail: Some(d.signature.clone()),
+                kind: match kind {
+                    Kind::Relation => SymbolKind::STRUCT,
+                    Kind::Functor => SymbolKind::FUNCTION,
+                    Kind::Type => SymbolKind::INTERFACE,
+                },
+                tags: None,
+                deprecated: None,
+                range: d.range,
+                selection_range: d.range,
+                children: None,
+            });
+        }
+    }
+    syms.sort_by_key(|s| (s.range.start.line, s.range.start.character));
+    DocumentSymbolResponse::Nested(syms)
+}
+
+fn completion(docs: &HashMap<Url, String>, uri: &Url) -> CompletionResponse {
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut push = |label: &str, kind: CompletionItemKind, detail: &str| {
+        items.push(CompletionItem {
+            label: label.to_string(),
+            kind: Some(kind),
+            detail: Some(detail.to_string()),
+            ..Default::default()
+        });
+    };
+    for d in DIRECTIVES {
+        push(d, CompletionItemKind::KEYWORD, "directive");
+    }
+    for t in TYPES {
+        push(t, CompletionItemKind::TYPE_PARAMETER, "type");
+    }
+    for k in KEYWORDS {
+        push(k, CompletionItemKind::KEYWORD, "keyword");
+    }
+    if let Some(text) = docs.get(uri) {
+        let index = symbols::build(text);
+        for (kind, name) in index.defs.keys() {
+            let (ck, detail) = match kind {
+                Kind::Relation => (CompletionItemKind::STRUCT, "relation"),
+                Kind::Functor => (CompletionItemKind::FUNCTION, "functor"),
+                Kind::Type => (CompletionItemKind::INTERFACE, "type"),
+            };
+            push(name, ck, detail);
+        }
+    }
+    CompletionResponse::Array(items)
 }
 
 fn publish(conn: &Connection, uri: Url, text: &str) -> Res {
